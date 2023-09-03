@@ -1,0 +1,387 @@
+---
+    name: Node.js CI
+
+    on:
+      workflow_call:
+        inputs:
+          ARTIFACT_PATH:
+            description: The path containing the built application. By default the
+              entire workspace will be uploaded. This can be overriden by specifying
+              a specific path/file.
+            required: false
+            type: string
+          ARTIFACT_RETENTION:
+            default: 1
+            description: How long to store uploaeded artifacts of the workspace
+            required: false
+            type: number
+          BUILD_COMMAND:
+            default: npm rebuild && npm run prepare --if-present
+            description: The command/arguments for building.
+            required: false
+            type: string
+          CACHE_PATH:
+            description: The path to use as the identifier for hash comparison
+              to identify GitHub cache.
+            default: |
+              **/package-lock.json
+              **/npm-shrinkwrap.json
+            required: false
+            type: string
+          CODE_QL_CONFIG:
+            description: The path to a custom code-ql config file
+            required: false
+            type: string
+          CODEQL_LANGUAGES:
+            default: JavaScript
+            description: "Comma separate list of supported languages.
+              ie: 'JavaScript' | 'JavaScript, TypeScript'"
+            required: false
+            type: string
+          COVERAGE_ANNOTATIONS:
+            default: none
+            description: "Options: all|none|coverage|failed-tests:
+              all (default) : Will annotate sections of your code that failed tests
+                              or test did not cover
+              none          : Turns off annotations
+              coverage      : Will annotate those sections of your code that test
+                              did not cover
+              failed-tests  : Will annotate those sections of your code that failed
+                              test"
+            required: false
+            type: string
+          COVERAGE_BASE_FILE:
+            default: ./coverage/report.json
+            description: "the filepath to the JSON coverage report from the branch
+              your pull request is merging into.You can opt-out coverage comparison
+              features to speed-up action. To achieve this, firstly, collect
+              coverage to report.json file. Then, specify report.json for
+              BASE_COVERAGE_FILE"
+            required: false
+            type: string
+          COVERAGE_FILE:
+            default: ./coverage/report.json
+            description: "The filepath to the JSON coverage report for the current
+              pull request. You can opt-out coverage comparison features to speed-up
+              action. To achieve this, firstly, collect coverage to report.json
+              file. Then, specify report.json for COVERAGE_FILE"
+            required: false
+            type: string
+          DEFAULT_BRANCH:
+            description: The default branch to be used in dependency diff. If not
+              set the pipeline will determine this via GitHub Event.
+            required: false
+            type: string
+          DEPS_SEVERITY:
+            default: moderate
+            description: The allowed severity level of dependency violations.
+            required: false
+            type: string
+          FORCE_ARTIFACT:
+            default: false
+            description: This option will force the pipeline to genearate an
+              artifact.
+            required: false
+            type: boolean
+          INSTALL_COMMAND:
+            default: npm ci --quiet --ignore-scripts
+            description: The install command to use. Defaults to `ci`.
+            required: false
+            type: string
+          JEST_COVERAGE:
+            default: false
+            description: Whether or not code coverage will be generated.
+            required: false
+            type: boolean
+          LET_JEST_COVERAGE_RUN_TESTS:
+            default: false
+            description: Enabling this will signal the Jest Coverage action to
+              execute tests. If enabled this will skip the independent test step.
+              Note that this method attempts to run test in both the HEAD & BASE
+              branches. If the base doesn't have tests it will fail.
+            required: false
+            type: boolean
+          NODE_CACHE_TYPE:
+            default: npm
+            description: "Select caching method. See:
+              https://github.com/actions/setup-node#caching-global-packages-data"
+            required: false
+            type: string
+          NODE_VERSION:
+            default: '12'
+            description: "The version of Node.js to load. Defaults to 12. This will
+              take the latest version of 12.x.x"
+            required: false
+            type: string
+          NPM_CONFIG_PREFIX:
+            description: Path to project if not in root directory
+            required: false
+            type: string
+          PUBLISH:
+            default: 'false'
+            description: If this is a publish run.
+            required: false
+            type: string
+          SKIP_TEST:
+            default: false
+            description: Skip tests entirely
+            required: false
+            type: boolean
+          TEST_COMMAND:
+            default: npm run test --if-present --passWithNoTests
+            description: The command/arguments for unit testing.
+            required: false
+            type: string
+          WITH_INPUT:
+            default: '{}'
+            description: JSON string of inputs to be passed between workflows.
+            required: false
+            type: string
+        outputs: # Required for the artifact/download during publish run
+          WITH_OUTPUT:
+            description: JSON string of outputs to be passed between workflows.
+            value: ${{ jobs.npm-build-test.outputs.BUILD_TEST_JSON }}
+
+    jobs:
+
+      npm-build-test:
+        name: CI - Build Test
+        runs-on: ubuntu-latest
+        env:
+          isDEPENDABOT: ${{ github.actor == 'dependabot[bot]' }}
+          isPULL_REQUEST: ${{ github.event_name == 'pull_request' }}
+          ARTIFACT_PATH: ${{ inputs.ARTIFACT_PATH || github.workspace }}
+          BASH_DEBUG: |
+            PS4='$LINENO:'
+            set -x
+          DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+          PUBLISH: ${{ inputs.PUBLISH }}
+          RUN_CODEQL: ${{ !(startsWith(github.ref, 'refs/tags/')) }}
+          WITH_INPUT: ${{ inputs.WITH_INPUT }}
+        outputs:
+          BUILD_TEST_JSON: ${{ steps.export.outputs.BUILD_TEST_JSON }}
+        steps:
+
+          - name: Checkout
+            uses: actions/checkout@v3.6.0
+
+          - name: Event Obj Debug
+            env:
+              EVENT_OBJ: ${{ toJSON(github.event) }}
+            if: env.DEBUG == 'true'
+            run: jq '.' <<< "$EVENT_OBJ"
+
+          - name: 'Dependency Review'
+            continue-on-error: true
+            uses: actions/dependency-review-action@v3.0.8
+            env:
+              ALLOWED_LICENCES: |
+                MIT, BSD-2-Clause, Apache-1.0, Apache-1.1, Apache-2.0, CC0-1.0
+              DEPS_SEVERITY: moderate
+            with:
+              allow-licenses: ${{ env.ALLOWED_LICENCES }}
+              base-ref: ${{ inputs.DEFAULT_BRANCH ||
+                github.event.repository.default_branch }}
+              fail-on-severity: ${{ env.DEPS_SEVERITY }}
+              head-ref: ${{ github.event.pull_request.head.ref ||
+                github.ref_name }}
+
+          # Prepare Node.js environment
+          - name: Setup Node.js ${{ inputs.NODE_VERSION }}
+            id: setup-node
+            uses: actions/setup-node@v3.8.1
+            with:
+              cache: ${{ inputs.NODE_CACHE_TYPE }}
+              cache-dependency-path: ${{ inputs.CACHE_PATH }}
+              node-version: ${{ inputs.NODE_VERSION }}
+
+          # Initializes CodeQL tools for scanning.
+          - name: Initialize CodeQL
+            if: env.RUN_CODEQL == true
+            uses: github/codeql-action/init@v2.21.5
+            with:
+              config-file: ${{ inputs.CODE_QL_CONFIG }}
+              languages: ${{ inputs.CODEQL_LANGUAGES }}
+
+          # Install deps if not cached
+          # We ignore scripts to secure the token if used.
+          - name: Install
+            run: ${{ inputs.INSTALL_COMMAND }}
+
+          # Build if necessary
+          - name: Build
+            run: ${{ inputs.BUILD_COMMAND }}
+
+          # Run tests
+          - name: Tests
+            if: inputs.SKIP_TEST == false &&
+              inputs.LET_JEST_COVERAGE_RUN_TESTS == false
+            run: ${{ inputs.TEST_COMMAND }}
+
+          # Code Analysis
+          - name: Perform CodeQL Analysis
+            id: codeql-analysis
+            if: env.RUN_CODEQL == true
+            uses: github/codeql-action/analyze@v2.21.5
+
+          # Generate coverage report and comment in PR comments
+          - name: Add coverage to PR
+            if: ${{
+                env.isPULL_REQUEST == 'true' &&
+                env.isDEPENDABOT != 'true' &&
+                inputs.JEST_COVERAGE == true
+              }}
+            id: coverage
+            uses: ArtiomTr/jest-coverage-report-action@v2.2.4
+            with:
+              annotations: ${{ inputs.COVERAGE_ANNOTATIONS }}
+              base-coverage-file: ${{ env.BASE_COVERAGE_FILE }}
+              coverage-file: ${{ env.HEAD_COVERAGE_FILE }}
+              skip-step: ${{ env.SKIP_TESTS }}
+              test-script: ${{ inputs.TEST_COMMAND }}
+            env:
+              SKIP_TESTS: >
+                ${{ inputs.LET_JEST_COVERAGE_RUN_TESTS == true &&
+                'install' || 'all' }}
+              BASE_COVERAGE_FILE: >
+                ${{ inputs.LET_JEST_COVERAGE_RUN_TESTS == true && ' ' ||
+                inputs.COVERAGE_BASE_FILE }}
+              HEAD_COVERAGE_FILE: >
+                ${{ inputs.LET_JEST_COVERAGE_RUN_TESTS == true && ' ' ||
+                inputs.COVERAGE_FILE }}
+
+          # Return Uploaded artifact version/name for publishing
+          - name: Artifact Info
+            if: ${{
+                (
+                  env.PUBLISH == 'true' ||
+                  inputs.FORCE_ARTIFACT == true ||
+                  env.isPULL_REQUEST == 'true' ||
+                  env.DEBUG == 'true'
+                )
+              }}
+            id: artifacts
+            run: |
+
+              [[ "$DEBUG" == true ]] && eval "$BASH_DEBUG"
+
+              # Version comes from package.json
+              if [ -n "$NPM_CONFIG_PREFIX" ]; then
+                PACKAGE_JSON_PATH="$NPM_CONFIG_PREFIX/$PACKAGE_JSON_PATH"
+                echo "::debug::Package Json Path: $PACKAGE_JSON_PATH"
+              fi
+
+              if [[ "$PACKAGE_JSON_PATH" != ./* ]]; then
+                PACKAGE_JSON_PATH="./$PACKAGE_JSON_PATH"
+                echo "::debug::Package Json Path: $PACKAGE_JSON_PATH"
+              fi
+
+              ARTIFACT_VERSION=$(node -p "(require('$PACKAGE_JSON_PATH').version)")
+
+              echo "ARTIFACT_VERSION: $ARTIFACT_VERSION"
+              if [ -z "$ARTIFACT_VERSION" ]; then
+                MSG=Unable to detect version.
+                echo "::error file=$PACKAGE_JSON_PATH::$MSG"
+              fi
+              echo "ARTIFACT_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
+
+              # Artifact name/path to pass back for publishing
+              # Format = PR_###-<RepoName>-<Version> || <RepoName>-<Version>
+              if [ -n "$ARTIFACT_VERSION" ]; then
+                ARTIFACT_NAME="${{ github.event_name == 'pull_request' &&
+                format('{0}_{1}-{2}','PR', github.event.number,
+                github.event.repository.name) ||
+                github.event.repository.name }}-$ARTIFACT_VERSION"
+
+                echo "ARTIFACT_NAME: $ARTIFACT_NAME"
+                if [ -z "$ARTIFACT_NAME" ]; then
+                  echo "::error::Error retrieving artifact name."
+                fi
+
+                echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
+              fi
+            env:
+              NPM_CONFIG_PREFIX: ${{ env.NPM_CONFIG_PREFIX ||
+                inputs.NPM_CONFIG_PREFIX }}
+              PACKAGE_JSON_PATH: package.json
+
+          # Upload artifact (workspace) for publishing
+          - name: Upload Artifact
+            if: env.ARTIFACT_NAME != null
+            id: upload
+            uses: actions/upload-artifact@v3.1.2
+            with:
+              name: ${{ env.ARTIFACT_NAME }}
+              path: |
+                ${{ env.ARTIFACT_PATH }}
+                !**/node_modules
+              retention-days: ${{ inputs.ARTIFACT_RETENTION }}
+              if-no-files-found: error
+
+          - name: Comment on Pull Request ${{ env.PR_URL }}
+            if: env.isPULL_REQUEST == 'true' &&
+              steps.upload.conclusion == 'success'
+            env:
+              ACTOR: ${{github.actor }}
+              ARTIFACT_VERSION: ${{ steps.artifacts.outputs.ARTIFACT_VERSION }}
+              GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+              JOB: ${{ github.job }}
+              OWNER: ${{ github.repository_owner }}
+              PR_URL: ${{github.event.pull_request.html_url}}
+              REPO: ${{ github.event.repository.name }}
+              RUN_ID: ${{ github.run_id }}
+            run: |
+
+              [[ "$DEBUG" == true ]] && eval "$BASH_DEBUG"
+
+              # Formulate the job path for later linkage
+              JOB_URL="https://github.com/$OWNER/$REPO/actions/runs/$RUN_ID"
+              JOB_LINK="[$RUN_ID]($JOB_URL)"
+
+              # Build PR body
+              BODY+="Artifact(s) have been uploaded from run $JOB_LINK:
+
+              This job was initiated by: $ACTOR and contains: $ARTIFACT_NAME"
+
+              # Comment on Pull Request. Since we can't retrieve the paths of
+              # any and all artifacts in an active job run we settle for just
+              # saying that they exist.
+              gh pr review --comment --body "$BODY" "$PR_URL"
+
+          - name: Export
+            env:
+              ARTIFACT_PATH: ${{ env.ARTIFACT_PATH }}
+              NODE_CACHE_TYPE: ${{ inputs.NODE_CACHE_TYPE }}
+              NPM_CONFIG_PREFIX: ${{ inputs.NPM_CONFIG_PREFIX }}
+              SARIF_ID: ${{ steps.codeql-analysis.outputs.sarif-id }}
+              NODE_VERSION: ${{ steps.setup-node.outputs.node-version }}
+            id: export
+            run: |
+
+              [[ "$DEBUG" == true ]] && eval "$BASH_DEBUG"
+
+              echo "::group::Build Test Json"
+                BUILD_TEST_JSON=$(jq \
+                  --arg artifactName "$ARTIFACT_NAME" \
+                  --arg artifactPath "$ARTIFACT_PATH" \
+                  --arg artifactVersion "$ARTIFACT_VERSION" \
+                  --arg nodeCacheType "$NODE_CACHE_TYPE" \
+                  --arg nodeConfigPrefix "$NPM_CONFIG_PREFIX" \
+                  --arg nodeVersion "$NODE_VERSION" \
+                  --arg sarifId "$SARIF_ID" \
+                  --compact-output \
+                  --null-input \
+                  '{
+                    ARTIFACT_NAME: $artifactName,
+                    ARTIFACT_PATH: $artifactPath,
+                    ARTIFACT_VERSION: $artifactVersion,
+                    NODE_CACHE_TYPE: $nodeCacheType,
+                    NPM_CONFIG_PREFIX: $nodeConfigPrefix,
+                    NODE_VERSION: $nodeVersion,
+                    SARIF_ID: $sarifId
+                  }'
+                )
+                echo "BUILD_TEST_JSON=$BUILD_TEST_JSON" >> "$GITHUB_OUTPUT"
+
+                jq --color-output '.' <<< "$BUILD_TEST_JSON"
+              echo "::endgroup::"
